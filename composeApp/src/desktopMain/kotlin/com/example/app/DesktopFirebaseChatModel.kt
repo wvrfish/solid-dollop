@@ -1,19 +1,10 @@
 package com.example.app
 
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
-import kotlinx.serialization.json.putJsonObject
 
 // ---------------------------------------------------------------------------
 // CloudModel
@@ -26,53 +17,16 @@ enum class CloudModel(val modelName: String) {
 }
 
 // ---------------------------------------------------------------------------
-// Gemini content-building helpers
-// ---------------------------------------------------------------------------
-
-private fun userContent(text: String): JsonObject = buildJsonObject {
-    put("role", "user")
-    putJsonArray("parts") { add(buildJsonObject { put("text", text) }) }
-}
-
-private fun modelContent(text: String): JsonObject = buildJsonObject {
-    put("role", "model")
-    putJsonArray("parts") { add(buildJsonObject { put("text", text) }) }
-}
-
-private fun functionResponseContent(name: String, response: JsonObject): JsonObject = buildJsonObject {
-    put("role", "function")
-    putJsonArray("parts") {
-        add(buildJsonObject {
-            putJsonObject("functionResponse") {
-                put("name", name)
-                put("response", response)
-            }
-        })
-    }
-}
-
-private fun <P> ModelTool<P>.toFunctionDeclarationJson(): JsonObject = buildJsonObject {
-    put("name", name)
-    put("description", description)
-    val props = group.params.mapNotNull { p -> p.schema()?.let { p.name to it.toGeminiJson() } }
-    if (props.isNotEmpty()) {
-        putJsonObject("parameters") {
-            put("type", "OBJECT")
-            putJsonObject("properties") { props.forEach { (k, v) -> put(k, v) } }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // DesktopFirebaseChatModel
 // ---------------------------------------------------------------------------
 
 /**
  * Desktop (JVM) implementation of [GenerativeChatModel] using the Gemini
- * REST API via [GeminiClient].
+ * Developer API via [GeminiClient] / [GeminiChatSession].
  *
- * Mirrors the Android `FirebaseChatModel` — same function-calling loop,
- * same history management — but targets the Gemini Developer API over HTTP.
+ * Mirrors the Android `FirebaseChatModel` — same function-calling loop and
+ * history management — but targets the Gemini REST API over HTTPS instead of
+ * the Firebase Android AI SDK.
  *
  * Set the `GEMINI_API_KEY` environment variable to your Google AI Studio key.
  */
@@ -80,6 +34,8 @@ class DesktopFirebaseChatModel(
     val cloudModel: CloudModel = CloudModel.Gemini25Flash,
     private val apiKey: String = System.getenv("GEMINI_API_KEY")
         ?: error("GEMINI_API_KEY environment variable is not set"),
+    private val generationConfig: GenerationConfig? = null,
+    private val safetySettings: List<SafetySetting> = emptyList(),
 ) : GenerativeChatModel {
 
     override fun configure(
@@ -88,83 +44,75 @@ class DesktopFirebaseChatModel(
         schema: AISchema?,
         tools: List<ModelTool<*>>,
     ): GenerativeChatModel.Configured {
-        val client = GeminiClient(apiKey = apiKey, modelName = cloudModel.modelName)
-
-        val toolsJson: JsonArray? = if (tools.isEmpty()) null else buildJsonArray {
-            add(buildJsonObject {
-                putJsonArray("functionDeclarations") {
-                    tools.forEach { add(it.toFunctionDeclarationJson()) }
-                }
-            })
-        }
-
-        val systemInstruction: JsonObject? = instruction?.let {
-            buildJsonObject {
-                putJsonArray("parts") { add(buildJsonObject { put("text", it) }) }
-            }
-        }
-
-        // Seed history: even indices → user turns, odd → model turns.
-        val historyContents = history.mapIndexed { i, msg ->
-            if (i % 2 == 0) userContent(msg) else modelContent(msg)
-        }
-
-        return ConfiguredModel(
-            client = client,
-            systemInstruction = systemInstruction,
-            toolsJson = toolsJson,
-            tools = tools,
-            history = historyContents.toMutableList(),
+        val client = GeminiClient(
+            modelName = cloudModel.modelName,
+            apiKey = apiKey,
+            generationConfig = generationConfig,
+            safetySettings = safetySettings,
         )
+
+        val geminiTools = tools
+            .map { it.toGeminiFunctionDeclaration() }
+            .takeIf { it.isNotEmpty() }
+            ?.let { listOf(GeminiTool(it)) }
+            ?: emptyList()
+
+        // Even indices → user turns, odd → model turns, matching the Android side.
+        val historyContents = history.mapIndexed { i, msg ->
+            if (i % 2 == 0) Content.user(msg) else Content.model(msg)
+        }
+
+        val session = client.startChat(
+            history = historyContents,
+            systemInstruction = instruction?.let { Content("system", listOf(TextPart(it))) },
+            tools = geminiTools,
+        )
+
+        return ConfiguredModel(session = session, tools = tools)
     }
 
     // -----------------------------------------------------------------------
 
     class ConfiguredModel(
-        private val client: GeminiClient,
-        private val systemInstruction: JsonObject?,
-        private val toolsJson: JsonArray?,
+        private val session: GeminiChatSession,
         private val tools: List<ModelTool<*>>,
-        private val history: MutableList<JsonObject>,
     ) : GenerativeChatModel.Configured {
 
-        override suspend fun sendMessage(prompt: String): String = withContext(Dispatchers.IO) {
-            history.add(userContent(prompt))
+        private val json = Json { ignoreUnknownKeys = true }
 
-            var responseContent = client.generateContent(systemInstruction, history, toolsJson)
-            history.add(responseContent)
+        override suspend fun sendMessage(prompt: String): String {
+            var response = session.sendMessage(prompt)
 
             // Function-calling loop — mirrors the Android FirebaseChatModel
-            while (true) {
-                val functionCalls = responseContent["parts"]
-                    ?.jsonArray
-                    ?.mapNotNull { it.jsonObject["functionCall"]?.jsonObject }
-                    ?: break
-                if (functionCalls.isEmpty()) break
-
-                val responseParts = functionCalls.mapNotNull { call ->
-                    val name = call["name"]?.jsonPrimitive?.content ?: return@mapNotNull null
-                    val args = call["args"]?.jsonObject ?: JsonObject(emptyMap())
-                    val tool = tools.firstOrNull { it.name == name } ?: return@mapNotNull null
-                    val result = tool.execute(JsonElementMapper, args)
-                    name to client.decodeJson(result)
+            while (response.functionCalls.isNotEmpty()) {
+                val functionResponses = response.functionCalls.mapNotNull { call ->
+                    val tool = tools.firstOrNull { it.name == call.name } ?: return@mapNotNull null
+                    val result = tool.execute(JsonElementMapper, call.args)
+                    val decoded = json.decodeFromString<JsonObject>(result)
+                    FunctionResponsePart(name = call.name, response = decoded, id = call.id)
                 }
-                if (responseParts.isEmpty()) break
+                if (functionResponses.isEmpty()) break
 
-                responseParts.forEach { (name, decoded) ->
-                    history.add(functionResponseContent(name, decoded))
-                }
-
-                responseContent = client.generateContent(systemInstruction, history, toolsJson)
-                history.add(responseContent)
+                response = session.sendMessage(Content("function", functionResponses))
             }
 
-            responseContent["parts"]
-                ?.jsonArray
-                ?.firstNotNullOfOrNull { it.jsonObject["text"]?.jsonPrimitive?.content }
+            return response.text
                 ?: throw IllegalStateException("DesktopFirebaseChatModel: model returned no text")
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ModelTool → GeminiFunctionDeclaration
+// ---------------------------------------------------------------------------
+
+private fun ModelTool<*>.toGeminiFunctionDeclaration(): GeminiFunctionDeclaration {
+    val props = group.params.mapNotNull { p -> p.schema()?.let { p.name to it } }.toMap()
+    return GeminiFunctionDeclaration(
+        name = name,
+        description = description,
+        parameters = props.takeIf { it.isNotEmpty() }?.let { AISchema.ObjectType(it) },
+    )
 }
 
 // ---------------------------------------------------------------------------
